@@ -183,6 +183,121 @@ class SwapChainFinish:
         return {"ui": {"images": [{"filename": name, "subfolder": sub, "type": "output"}], "animated": (True,)}}
 
 
-NODE_CLASS_MAPPINGS = {"SwapChainLoad": SwapChainLoad, "SwapChainFinish": SwapChainFinish}
+class SwapChainLoadLTX:
+    """Start or continue a chain for the LTX Ripple graph (first-frame edit + propagation).
+
+    Step 1: video = the guide clip. The graph edits frame 0 itself (Qwen) from the reference photo it loads on its own.
+    Later steps: video = the previous step's result. Its last frame becomes the next chunk's finished first frame
+    (own_frame, own_present = "1"), so each chunk starts exactly where the last one ended and the character stays the same.
+
+    Outputs mirror LoadVideoFromURLMatched (frames = N-1 source frames, width, height, length N = 8k+1, fps) plus the first
+    frame to use and a ctx string for Finish.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "video": ("STRING", {"default": ""}),
+            "width": ("INT", {"default": 0, "min": 0, "max": 16384}),
+            "height": ("INT", {"default": 0, "min": 0, "max": 16384}),
+            "max_chunk_frames": ("INT", {"default": 160, "min": 8, "max": 400, "step": 1}),
+            "target_pixels": ("INT", {"default": 393216, "min": 65536, "max": 4194304}),
+            "max_seconds": ("INT", {"default": 60, "min": 1, "max": 600}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "FLOAT", "IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("frames", "width", "height", "length", "fps", "own_frame", "own_present", "ctx")
+    FUNCTION = "run"
+    CATEGORY = "SwapChain"
+
+    async def run(self, video, width, height, max_chunk_frames, target_pixels, max_seconds):
+        return await asyncio.to_thread(self._run, video, width, height, max_chunk_frames, target_pixels, max_seconds)
+
+    def _run(self, video, width, height, max_chunk_frames, target_pixels, max_seconds):
+        import torch
+        work = tempfile.mkdtemp(prefix="swapchain_")
+        src = _resolve(video, work)
+        if not src:
+            raise RuntimeError("video is empty: give the guide clip (/video1:URL) or the previous step (/video1:R<hash>)")
+        own, own_present = None, ""
+        if core.is_chain(src):
+            prev = src
+            st, vsec = core.read_state(prev)
+            if st.get("done"):
+                raise RuntimeError("this chain is already complete (done=true): nothing left to render")
+            if st.get("engine") != "ltx":
+                raise RuntimeError("this chain was made by the H3 workflow, not the ripple one")
+            w, h = int(st["w"]), int(st["h"])
+            cursor, total, step = float(st.get("cursor") or vsec), float(st["total"]), int(st.get("step", 0)) + 1
+            guide_path, guide_idx = prev, 1
+            has_audio = bool(st.get("has_audio"))
+            own = core.last_frame(prev, os.path.join(work, "last.png"))
+            own_present = "1"
+            guide_clip = guide_audio = ""
+        else:
+            prev = None
+            info = core.probe(src)
+            vs, secs = core.main_video(info)
+            total = min(secs, float(max_seconds))
+            w, h = core.pick_size(int(vs["width"]), int(vs["height"]), width, height, target_pixels)
+            guide_path = core.prepare_guide(src, os.path.join(work, "guide.mp4"), w, h, total)
+            guide_idx = 0
+            audio_path = core.extract_audio(src, os.path.join(work, "guide_audio.m4a"), total)
+            has_audio = bool(audio_path)
+            cursor, step = 0.0, 1
+            guide_clip, guide_audio = guide_path, audio_path or ""
+        frames = core.pick_frames_ltx(cursor, total, max_chunk_frames)
+        gf = core.decode_guide(guide_path, guide_idx, cursor, frames, w, h)
+        own_t = _image_tensor(own) if own else torch.zeros((1, h, w, 3), dtype=torch.float32)
+        ctx = {"engine": "ltx", "prev": prev, "work": work, "cursor": cursor, "frames": frames, "total": total, "step": step,
+               "steps_total": core.count_steps_ltx(total, max_chunk_frames), "w": w, "h": h, "cuts": [],
+               "has_audio": has_audio, "guide_clip": guide_clip, "guide_audio": guide_audio, "prompt": ""}
+        return (_image_tensor(gf), int(w), int(h), int(frames + 1), 24.0, own_t, own_present, json.dumps(ctx))
+
+
+class SwapChainFinishLTX:
+    """Stitch a ripple chunk (N frames: the first-frame edit, then the chunk) after the previous video and save."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "ctx": ("STRING", {"forceInput": True}),
+            "fps": ("INT", {"default": 24, "min": 8, "max": 60}),
+            "drop_first": ("INT", {"default": 1, "min": 0, "max": 4}),
+            "filename_prefix": ("STRING", {"default": "video/SwapRipple"}),
+        }}
+
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    CATEGORY = "SwapChain"
+
+    async def run(self, images, ctx, fps, drop_first, filename_prefix):
+        return await asyncio.to_thread(self._run, images, ctx, fps, drop_first, filename_prefix)
+
+    def _run(self, images, ctx, fps, drop_first, filename_prefix):
+        import folder_paths
+        c = json.loads(ctx)
+        arr = (images.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)[int(drop_first):][: c["frames"]]
+        clip = core.write_clip(arr, fps, (c["w"], c["h"]), os.path.join(c["work"], "newclip.mp4"))
+        new_cursor = c["cursor"] + c["frames"] / core.FPS
+        done = new_cursor >= c["total"] - 0.05
+        state = {"tag": core.TAG, "engine": "ltx", "cursor": round(new_cursor, 4), "total": round(c["total"], 4), "done": done,
+                 "step": c["step"], "steps_total": c["steps_total"], "w": c["w"], "h": c["h"], "has_audio": c["has_audio"]}
+        out_dir = folder_paths.get_output_directory()
+        sub, prefix = os.path.split(filename_prefix)
+        os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
+        name = f"{prefix}_{int(time.time())}_{c['step']:03d}.mp4"
+        out_path = os.path.join(out_dir, sub, name)
+        core.finish(c["work"], clip, c["prev"], c.get("guide_clip") or None, c.get("guide_audio") or None, None, state,
+                    out_path, c["total"])
+        return {"ui": {"images": [{"filename": name, "subfolder": sub, "type": "output"}], "animated": (True,)}}
+
+
+NODE_CLASS_MAPPINGS = {"SwapChainLoad": SwapChainLoad, "SwapChainFinish": SwapChainFinish,
+                       "SwapChainLoadLTX": SwapChainLoadLTX, "SwapChainFinishLTX": SwapChainFinishLTX}
 NODE_DISPLAY_NAME_MAPPINGS = {"SwapChainLoad": "Swap Chain - Load / Continue",
-                              "SwapChainFinish": "Swap Chain - Stitch and Save"}
+                              "SwapChainFinish": "Swap Chain - Stitch and Save",
+                              "SwapChainLoadLTX": "Swap Chain (ripple) - Load / Continue",
+                              "SwapChainFinishLTX": "Swap Chain (ripple) - Stitch and Save"}

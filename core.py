@@ -123,6 +123,35 @@ def pick_frames(cursor, total, max_frames=MAX_FRAMES, cuts=(), tol=0.12):
     return max_frames
 
 
+def pick_frames_ltx(cursor, total, max_frames=160):
+    """LTX Ripple grid: frames per step is a multiple of 8 (the graph runs N = frames + 1, 8k+1). The last stretch is rendered out."""
+    f = max(8, (int(max_frames) // 8) * 8)
+    remaining = total - cursor
+    if remaining <= f / FPS + 0.05:
+        return max(8, int(math.ceil(remaining * FPS / 8 - 1e-6)) * 8)
+    return f
+
+
+def count_steps_ltx(total, max_frames=160):
+    """How many steps a clip of `total` seconds takes (for progress displays)."""
+    cursor, n = 0.0, 0
+    while cursor < total - 0.05 and n < 1000:
+        cursor += pick_frames_ltx(cursor, total, max_frames) / FPS
+        n += 1
+    return n
+
+
+def last_frame(path, out_png):
+    """Last frame of the MAIN video stream of a chain file (the container also holds the guide, so seek by the stream's own duration)."""
+    vdur = main_video(probe(path))[1]
+    if os.path.isfile(out_png):
+        os.remove(out_png)
+    r = _run(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.0, vdur - 0.25):.3f}", "-i", path, "-map", "0:v:0", "-update", "1", out_png])
+    if r.returncode or not os.path.isfile(out_png):
+        raise RuntimeError(f"last frame extract failed: {r.stderr[-300:]!r}")
+    return out_png
+
+
 def decode_guide(path, video_index, cursor, frames, w, h):
     """Guide frames [frames, h, w, 3] uint8 from the `video_index`-th video stream of `path`, starting at `cursor` s.
     Past the end of the guide the last frame is repeated."""
@@ -239,8 +268,10 @@ def finish(work, new_clip, prev_video, guide_clip, guide_audio, ref_png, state, 
         cmd += ["-i", guide_clip]
         g_map = f"{n_in}:v:0"
         n_in += 1
-    cmd += ["-i", ref_png]
-    ref_map = f"{n_in}:v:0"
+    ref_map = None
+    if ref_png:
+        cmd += ["-i", ref_png]
+        ref_map = f"{n_in}:v:0"
     cmd += ["-map", "0:v:0"]
     if a_map:
         cmd += ["-map", a_map]
@@ -249,8 +280,12 @@ def finish(work, new_clip, prev_video, guide_clip, guide_audio, ref_png, state, 
         cmd += ["-c:v:0", "copy"]
     else:
         # the carried guide is not a playable track: no default flag, so players keep to stream 0
-        cmd += ["-map", g_map, "-map", ref_map, "-c:v:0", "copy", "-c:v:1", "copy", "-c:v:2", "png",
-                "-disposition:v:0", "default", "-disposition:v:1", "0", "-disposition:v:2", "attached_pic"]
+        cmd += ["-map", g_map]
+        if ref_map:
+            cmd += ["-map", ref_map]
+        cmd += ["-c:v:0", "copy", "-c:v:1", "copy", "-disposition:v:0", "default", "-disposition:v:1", "0"]
+        if ref_map:
+            cmd += ["-c:v:2", "png", "-disposition:v:2", "attached_pic"]
     if a_map:
         cmd += ["-c:a", "copy"]
     cmd += ["-metadata", "comment=" + json.dumps(state, separators=(",", ":")), "-movflags", "+faststart"]
