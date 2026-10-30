@@ -293,6 +293,7 @@ class SwapChainLoadLTX:
                 raise RuntimeError("this chain was made by the H3 workflow, not the ripple one")
             w, h = int(st["w"]), int(st["h"])
             cursor, total, step = float(st.get("cursor") or vsec), float(st["total"]), int(st.get("step", 0)) + 1
+            max_chunk_frames = int(st.get("chunk") or max_chunk_frames)   # fixed on step 1: later steps cannot move the chunks
             guide_path, guide_idx = prev, 1
             has_audio = bool(st.get("has_audio"))
             own = core.last_frame(prev, os.path.join(work, "last.png"))
@@ -339,6 +340,7 @@ class SwapChainLoadLTX:
         own_t = _image_tensor(own) if own else torch.zeros((1, h, w, 3), dtype=torch.float32)
         ctx = {"engine": "ltx", "mode": 0, "prev": prev, "work": work, "cursor": cursor, "frames": frames, "total": total,
                "step": step, "steps_total": steps_total, "w": w, "h": h, "cuts": [], "own_frames": own_frames,
+               "chunk": int(max_chunk_frames),
                "has_audio": has_audio, "guide_clip": guide_clip, "guide_audio": guide_audio, "prompt": "",
                "stills": [_fit_png(p, w, h, work, f"carry{i + 1:02d}.png") for i, p in enumerate(stills)]}
         return (_image_tensor(gf), int(w), int(h), int(frames + 1), 24.0, own_t, own_present, json.dumps(ctx),
@@ -386,7 +388,7 @@ class SwapChainFinishLTX:
         done = new_cursor >= c["total"] - 0.05
         state = {"tag": core.TAG, "engine": "ltx", "cursor": round(new_cursor, 4), "total": round(c["total"], 4), "done": done,
                  "step": c["step"], "steps_total": c["steps_total"], "w": c["w"], "h": c["h"], "has_audio": c["has_audio"],
-                 "own_frames": bool(c.get("own_frames"))}
+                 "own_frames": bool(c.get("own_frames")), "chunk": c.get("chunk")}
         out_dir = folder_paths.get_output_directory()
         sub, prefix = os.path.split(filename_prefix)
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)

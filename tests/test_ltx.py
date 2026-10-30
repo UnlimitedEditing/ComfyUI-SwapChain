@@ -151,4 +151,17 @@ try:
     raise SystemExit("expected a no-frames error")
 except RuntimeError as e:
     assert "edited frames" in str(e), e
+
+# the chunk size is fixed on step 1: a later step that sends a different (or default) length cannot move the chunks
+prev, cursors = "guide.mp4", []
+for step in range(1, 5):
+    length = 96 if step == 1 else 160
+    gf, w, h, ln, fps, own, op, ctx, _ = asyncio.run(N["SwapChainLoadLTX"]().run(prev, 0, 0, length, 393216, 60))
+    c = json.loads(ctx)
+    cursors.append((round(c["cursor"], 2), c["frames"]))
+    asyncio.run(N["SwapChainFinishLTX"]().run(torch.cat([own if op else gf[:1], gf], dim=0), ctx, 24, 1, "video/FX"))
+    prev = os.path.join(out, "video", sorted(f for f in os.listdir(os.path.join(out, "video")) if f.startswith("FX") and f.endswith(".mp4"))[-1])
+    if core.read_state(prev)[0]["done"]:
+        break
+assert cursors == [(0.0, 96), (4.0, 96), (8.0, 48)], cursors
 print("STACK CHAIN OK")
