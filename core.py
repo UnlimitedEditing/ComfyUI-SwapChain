@@ -18,9 +18,10 @@ import numpy as np
 
 FPS = 24
 SR = 44100
-MAX_FRAMES = 90           # 17k+5 grid; 90 = 3.75 s. Measured 105.7 s `Prompt executed` at 512x512 (RTX 4090)
+MAX_FRAMES = 124          # 17k+5 grid; 124 = 5.17 s. 90 f measured 72-105 s `Prompt executed` at 704x384 (4090)
 MIN_FRAMES = 22
 TAG = "swapchain/1"
+DEFAULT_DETAILS = "Person, average height, average build, natural hair, casual clothing"   # step 1 with no description
 
 
 def _run(cmd, **kw):
@@ -243,10 +244,15 @@ def finish(work, new_clip, prev_video, guide_clip, guide_audio, ref_png, state, 
     cmd += ["-map", "0:v:0"]
     if a_map:
         cmd += ["-map", a_map]
-    cmd += ["-map", g_map, "-map", ref_map, "-c:v:0", "copy", "-c:v:1", "copy", "-c:v:2", "png",
-            "-disposition:v:2", "attached_pic"]
+    if state.get("done"):
+        # finished: nothing will continue from this file, so deliver a clean video + audio file that any player handles
+        cmd += ["-c:v:0", "copy"]
+    else:
+        # the carried guide is not a playable track: no default flag, so players keep to stream 0
+        cmd += ["-map", g_map, "-map", ref_map, "-c:v:0", "copy", "-c:v:1", "copy", "-c:v:2", "png",
+                "-disposition:v:0", "default", "-disposition:v:1", "0", "-disposition:v:2", "attached_pic"]
     if a_map:
-        cmd += ["-c:a", "copy" if prev_video else "copy"]
+        cmd += ["-c:a", "copy"]
     cmd += ["-metadata", "comment=" + json.dumps(state, separators=(",", ":")), "-movflags", "+faststart"]
     if state.get("done"):
         cmd += ["-t", f"{total:.4f}"]

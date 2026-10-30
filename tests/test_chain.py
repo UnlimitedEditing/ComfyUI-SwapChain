@@ -76,6 +76,9 @@ for step in range(1, 12):
     st, vsec = core.read_state(prev)
     if st["done"]:
         break
+    inf = core.probe(prev)
+    vids = [s for s in inf["streams"] if s["codec_type"] == "video"]
+    assert vids[0]["disposition"]["default"] == 1 and vids[1]["disposition"]["default"] == 0, [v["disposition"] for v in vids]
 assert st["done"] and st["step"] == step and step >= 3, (st, step)
 assert len(set(sizes)) == 1 and sizes[0] == (512, 288) or sizes[0] == (480, 288) or True
 print("steps (cursor, frames):", steps)
@@ -83,7 +86,7 @@ print("size", sizes[0], "cuts", st["cuts"])
 info = core.probe(prev)
 kinds = [(s["codec_type"], s.get("disposition", {}).get("attached_pic", 0)) for s in info["streams"]]
 print("streams", kinds, "duration", info["format"]["duration"])
-assert kinds[0] == ("video", 0) and ("audio", 0) in kinds and kinds.count(("video", 0)) == 2 and ("video", 1) in kinds
+assert kinds == [("video", 0), ("audio", 0)], kinds   # the finished file is clean: no carried guide, no cover picture
 assert abs(float(info["format"]["duration"]) - 12.0) < 0.2, info["format"]["duration"]
 assert abs(core.main_video(info)[1] - 12.0) < 0.1
 assert any(abs(cut - 5.0) < 0.15 for cut in st["cuts"]), st["cuts"]

@@ -124,7 +124,7 @@ class SwapChainLoad:
             audio_path = core.extract_audio(src, os.path.join(work, "guide_audio.m4a"), total)
             audio_idx = 0 if audio_path else None
             has_audio = bool(audio_path)
-            cursor, step, use_prompt = 0.0, 1, prompt.strip()
+            cursor, step, use_prompt = 0.0, 1, prompt.strip() or core.DEFAULT_DETAILS
             ref, ref_ready = given, 0
 
         frames = core.pick_frames(cursor, total, max_chunk_frames, cuts)
