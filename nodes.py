@@ -46,6 +46,55 @@ def _image_tensor(path_or_array):
         torch.from_numpy(a.astype(np.float32) / 255.0)
 
 
+def _fit_frame(img, w, h, work):
+    """A supplied IMAGE tensor [1, H, W, 3] (any size) -> PNG path at exactly w x h (cover, centre crop)."""
+    from PIL import ImageOps
+    a = (img[0].cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)
+    fitted = ImageOps.fit(Image.fromarray(a), (int(w), int(h)), method=Image.LANCZOS)
+    path = os.path.join(work, "supplied.png")
+    fitted.save(path)
+    return path
+
+
+def _fit_png(path, w, h, work, name="fitted.png"):
+    """Any picture file -> a PNG at exactly w x h (cover, centre crop); returns the new path."""
+    from PIL import ImageOps
+    im = ImageOps.fit(Image.open(path).convert("RGB"), (int(w), int(h)), method=Image.LANCZOS)
+    out = os.path.join(work, name)
+    im.save(out)
+    return out
+
+
+def _stack(work, bundle, images):
+    """The ordered stack of edited frames: the pictures of `bundle` (video2) first, then image1..image8 in slot order.
+    A slot may hold a picture or a bundle (an mp4 with attached pictures); a bundle expands where it sits."""
+    out = []
+
+    def keep(path):
+        dst = os.path.join(work, f"stack{len(out) + 1:03d}.png")
+        Image.open(path).convert("RGB").save(dst)
+        out.append(dst)
+
+    def add_path(path):
+        try:
+            Image.open(path).verify()
+        except Exception:
+            sub = os.path.join(work, f"bundle{len(out):03d}")
+            os.makedirs(sub, exist_ok=True)
+            pics = core.extract_covers(path, sub)
+            if not pics:
+                raise RuntimeError(f"{os.path.basename(path)} is neither a picture nor a bundle of pictures")
+            for pic in pics:
+                keep(pic)
+            return
+        keep(path)
+
+    for ref in [bundle, *images]:
+        if (ref or "").strip():
+            add_path(_resolve(ref, work))
+    return out
+
+
 class SwapChainLoad:
     """Start or continue a swap chain.
 
@@ -186,12 +235,17 @@ class SwapChainFinish:
 class SwapChainLoadLTX:
     """Start or continue a chain for the LTX Ripple graph (first-frame edit + propagation).
 
-    Step 1: video = the guide clip. The graph edits frame 0 itself (Qwen) from the reference photo it loads on its own.
-    Later steps: video = the previous step's result. Its last frame becomes the next chunk's finished first frame
-    (own_frame, own_present = "1"), so each chunk starts exactly where the last one ended and the character stays the same.
+    mode 0 (swap, default). Step 1: video = the guide clip; the graph edits frame 0 itself (Qwen) from the reference photo
+    it loads on its own. Later steps: video = the previous step's result; its last frame becomes the next chunk's finished
+    first frame (own_present = "1"), so each chunk starts exactly where the last one ended.
+
+    mode 1 (frames only). Returns the guide's frame at the start of every chunk (chunk_frames) so you can edit them; no model
+    runs. mode 2 (your frames). Step 1 takes the edited frames as a stack: the pictures of `bundle` (video2) first, then
+    image1..image8 in slot order, where a slot may hold a picture or a bundle (an mp4 of pictures) that expands in place.
+    Chunk k then starts on picture k. The stack is stored in the result file, so later steps need only the previous hash.
 
     Outputs mirror LoadVideoFromURLMatched (frames = N-1 source frames, width, height, length N = 8k+1, fps) plus the first
-    frame to use and a ctx string for Finish.
+    frame to use, a ctx string for Finish and (mode 1) the stills.
     """
 
     @classmethod
@@ -203,23 +257,33 @@ class SwapChainLoadLTX:
             "max_chunk_frames": ("INT", {"default": 160, "min": 8, "max": 400, "step": 1}),
             "target_pixels": ("INT", {"default": 393216, "min": 65536, "max": 4194304}),
             "max_seconds": ("INT", {"default": 60, "min": 1, "max": 600}),
+        }, "optional": {
+            "bundle": ("STRING", {"default": ""}),
+            "image1": ("STRING", {"default": ""}), "image2": ("STRING", {"default": ""}),
+            "image3": ("STRING", {"default": ""}), "image4": ("STRING", {"default": ""}),
+            "image5": ("STRING", {"default": ""}), "image6": ("STRING", {"default": ""}),
+            "image7": ("STRING", {"default": ""}), "image8": ("STRING", {"default": ""}),
+            "mode": ("INT", {"default": 0, "min": 0, "max": 2}),
         }}
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "FLOAT", "IMAGE", "STRING", "STRING")
-    RETURN_NAMES = ("frames", "width", "height", "length", "fps", "own_frame", "own_present", "ctx")
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "FLOAT", "IMAGE", "STRING", "STRING", "IMAGE")
+    RETURN_NAMES = ("frames", "width", "height", "length", "fps", "own_frame", "own_present", "ctx", "chunk_frames")
     FUNCTION = "run"
     CATEGORY = "SwapChain"
 
-    async def run(self, video, width, height, max_chunk_frames, target_pixels, max_seconds):
-        return await asyncio.to_thread(self._run, video, width, height, max_chunk_frames, target_pixels, max_seconds)
+    async def run(self, video, width, height, max_chunk_frames, target_pixels, max_seconds, bundle="",
+                  image1="", image2="", image3="", image4="", image5="", image6="", image7="", image8="", mode=0):
+        return await asyncio.to_thread(self._run, video, width, height, max_chunk_frames, target_pixels, max_seconds, bundle,
+                                       [image1, image2, image3, image4, image5, image6, image7, image8], mode)
 
-    def _run(self, video, width, height, max_chunk_frames, target_pixels, max_seconds):
+    def _run(self, video, width, height, max_chunk_frames, target_pixels, max_seconds, bundle="", images=(), mode=0):
         import torch
+        mode = int(mode)
         work = tempfile.mkdtemp(prefix="swapchain_")
         src = _resolve(video, work)
         if not src:
             raise RuntimeError("video is empty: give the guide clip (/video1:URL) or the previous step (/video1:R<hash>)")
-        own, own_present = None, ""
+        own, own_present, stills, own_frames = None, "", [], False
         if core.is_chain(src):
             prev = src
             st, vsec = core.read_state(prev)
@@ -234,6 +298,8 @@ class SwapChainLoadLTX:
             own = core.last_frame(prev, os.path.join(work, "last.png"))
             own_present = "1"
             guide_clip = guide_audio = ""
+            own_frames = bool(st.get("own_frames"))
+            stills = core.extract_covers(prev, work) if own_frames else []
         else:
             prev = None
             info = core.probe(src)
@@ -246,13 +312,37 @@ class SwapChainLoadLTX:
             has_audio = bool(audio_path)
             cursor, step = 0.0, 1
             guide_clip, guide_audio = guide_path, audio_path or ""
+            if mode == 2:
+                own_frames = True
+                stills = _stack(work, bundle, images)
+                need = core.count_steps_ltx(total, max_chunk_frames)
+                if not stills:
+                    raise RuntimeError("your-frames mode needs the edited frames: image1..image8 and/or video2 (a bundle)")
+                if len(stills) < need:
+                    raise RuntimeError(f"this clip takes {need} steps (one edited frame each) and you gave {len(stills)}: "
+                                       f"run frames-only mode (slot6=1) and edit every frame it returns")
+        steps_total = core.count_steps_ltx(total, max_chunk_frames)
+        if mode == 1:
+            # frames only: the target frame at the start of every chunk, for the person to edit; no model runs
+            starts = core.chunk_starts_ltx(total, max_chunk_frames)
+            frames_arr = np.concatenate([core.decode_guide(guide_path, guide_idx, t, 1, w, h) for t in starts], axis=0)
+            blank = torch.zeros((1, h, w, 3), dtype=torch.float32)
+            ctx = {"engine": "ltx", "mode": 1, "work": work, "starts": [round(t, 3) for t in starts], "total": total,
+                   "steps_total": steps_total, "w": w, "h": h}
+            return (blank, int(w), int(h), 9, 24.0, blank, "", json.dumps(ctx), _image_tensor(frames_arr))
         frames = core.pick_frames_ltx(cursor, total, max_chunk_frames)
         gf = core.decode_guide(guide_path, guide_idx, cursor, frames, w, h)
+        # your-frames mode: chunk k starts on the k-th picture of the stack (instead of the AI edit or the previous last frame)
+        if own_frames and step - 1 < len(stills):
+            own = _fit_png(stills[step - 1], w, h, work)
+            own_present = "1"
         own_t = _image_tensor(own) if own else torch.zeros((1, h, w, 3), dtype=torch.float32)
-        ctx = {"engine": "ltx", "prev": prev, "work": work, "cursor": cursor, "frames": frames, "total": total, "step": step,
-               "steps_total": core.count_steps_ltx(total, max_chunk_frames), "w": w, "h": h, "cuts": [],
-               "has_audio": has_audio, "guide_clip": guide_clip, "guide_audio": guide_audio, "prompt": ""}
-        return (_image_tensor(gf), int(w), int(h), int(frames + 1), 24.0, own_t, own_present, json.dumps(ctx))
+        ctx = {"engine": "ltx", "mode": 0, "prev": prev, "work": work, "cursor": cursor, "frames": frames, "total": total,
+               "step": step, "steps_total": steps_total, "w": w, "h": h, "cuts": [], "own_frames": own_frames,
+               "has_audio": has_audio, "guide_clip": guide_clip, "guide_audio": guide_audio, "prompt": "",
+               "stills": [_fit_png(p, w, h, work, f"carry{i + 1:02d}.png") for i, p in enumerate(stills)]}
+        return (_image_tensor(gf), int(w), int(h), int(frames + 1), 24.0, own_t, own_present, json.dumps(ctx),
+                torch.zeros((1, h, w, 3), dtype=torch.float32))
 
 
 class SwapChainFinishLTX:
@@ -279,19 +369,31 @@ class SwapChainFinishLTX:
     def _run(self, images, ctx, fps, drop_first, filename_prefix):
         import folder_paths
         c = json.loads(ctx)
+        if c.get("mode") == 1:
+            # frames only: save the target frame of every chunk as its own picture, named by chunk and time
+            arr = (images.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)
+            out_dir = folder_paths.get_output_directory()
+            os.makedirs(os.path.join(out_dir, "frames"), exist_ok=True)
+            stamp, total, shown = int(time.time()), len(arr), []
+            for i, (a, t) in enumerate(zip(arr, c["starts"])):
+                name = f"chunk_{i + 1:02d}_of_{total:02d}_at_{t:.1f}s_{stamp}.png"
+                Image.fromarray(a).save(os.path.join(out_dir, "frames", name))
+                shown.append({"filename": name, "subfolder": "frames", "type": "output"})
+            return {"ui": {"images": shown}}
         arr = (images.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)[int(drop_first):][: c["frames"]]
         clip = core.write_clip(arr, fps, (c["w"], c["h"]), os.path.join(c["work"], "newclip.mp4"))
         new_cursor = c["cursor"] + c["frames"] / core.FPS
         done = new_cursor >= c["total"] - 0.05
         state = {"tag": core.TAG, "engine": "ltx", "cursor": round(new_cursor, 4), "total": round(c["total"], 4), "done": done,
-                 "step": c["step"], "steps_total": c["steps_total"], "w": c["w"], "h": c["h"], "has_audio": c["has_audio"]}
+                 "step": c["step"], "steps_total": c["steps_total"], "w": c["w"], "h": c["h"], "has_audio": c["has_audio"],
+                 "own_frames": bool(c.get("own_frames"))}
         out_dir = folder_paths.get_output_directory()
         sub, prefix = os.path.split(filename_prefix)
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
         name = f"{prefix}_{int(time.time())}_{c['step']:03d}.mp4"
         out_path = os.path.join(out_dir, sub, name)
-        core.finish(c["work"], clip, c["prev"], c.get("guide_clip") or None, c.get("guide_audio") or None, None, state,
-                    out_path, c["total"])
+        core.finish(c["work"], clip, c["prev"], c.get("guide_clip") or None, c.get("guide_audio") or None,
+                    c.get("stills") or None, state, out_path, c["total"])
         return {"ui": {"images": [{"filename": name, "subfolder": sub, "type": "output"}], "animated": (True,)}}
 
 

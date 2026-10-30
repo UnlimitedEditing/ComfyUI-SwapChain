@@ -132,6 +132,15 @@ def pick_frames_ltx(cursor, total, max_frames=160):
     return f
 
 
+def chunk_starts_ltx(total, max_frames=160):
+    """Start time (seconds) of every chunk of a clip of `total` seconds, for the frames-only mode."""
+    cursor, starts = 0.0, []
+    while cursor < total - 0.05 and len(starts) < 1000:
+        starts.append(cursor)
+        cursor += pick_frames_ltx(cursor, total, max_frames) / FPS
+    return starts
+
+
 def count_steps_ltx(total, max_frames=160):
     """How many steps a clip of `total` seconds takes (for progress displays)."""
     cursor, n = 0.0, 0
@@ -205,6 +214,19 @@ def is_chain(path):
         return False
 
 
+def extract_covers(path, out_dir):
+    """Every attached picture of a chain or bundle mp4, in stream order -> list of png paths (empty if none)."""
+    out = []
+    for s in probe(path)["streams"]:
+        if s["codec_type"] == "video" and s.get("disposition", {}).get("attached_pic"):
+            p = os.path.join(out_dir, f"still{len(out) + 1:02d}.png")
+            r = _run(["ffmpeg", "-y", "-v", "error", "-i", path, "-map", f"0:{s['index']}", "-frames:v", "1", p])
+            if r.returncode:
+                raise RuntimeError(f"picture extract failed: {r.stderr[-300:]!r}")
+            out.append(p)
+    return out
+
+
 def extract_cover(path, out_png):
     info = probe(path)
     for s in info["streams"]:
@@ -268,10 +290,13 @@ def finish(work, new_clip, prev_video, guide_clip, guide_audio, ref_png, state, 
         cmd += ["-i", guide_clip]
         g_map = f"{n_in}:v:0"
         n_in += 1
-    ref_map = None
-    if ref_png:
-        cmd += ["-i", ref_png]
-        ref_map = f"{n_in}:v:0"
+    # ref_png: one path, a list of paths (the edited frames a bundle gave us) or None; each becomes an attached picture
+    refs = [ref_png] if isinstance(ref_png, str) else list(ref_png or [])
+    ref_maps = []
+    for rp in refs:
+        cmd += ["-i", rp]
+        ref_maps.append(f"{n_in}:v:0")
+        n_in += 1
     cmd += ["-map", "0:v:0"]
     if a_map:
         cmd += ["-map", a_map]
@@ -281,11 +306,11 @@ def finish(work, new_clip, prev_video, guide_clip, guide_audio, ref_png, state, 
     else:
         # the carried guide is not a playable track: no default flag, so players keep to stream 0
         cmd += ["-map", g_map]
-        if ref_map:
-            cmd += ["-map", ref_map]
+        for rm in ref_maps:
+            cmd += ["-map", rm]
         cmd += ["-c:v:0", "copy", "-c:v:1", "copy", "-disposition:v:0", "default", "-disposition:v:1", "0"]
-        if ref_map:
-            cmd += ["-c:v:2", "png", "-disposition:v:2", "attached_pic"]
+        for k in range(len(ref_maps)):
+            cmd += [f"-c:v:{2 + k}", "png", f"-disposition:v:{2 + k}", "attached_pic"]
     if a_map:
         cmd += ["-c:a", "copy"]
     cmd += ["-metadata", "comment=" + json.dumps(state, separators=(",", ":")), "-movflags", "+faststart"]
