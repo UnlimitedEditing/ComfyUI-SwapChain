@@ -70,12 +70,18 @@ def _stack(work, bundle, images):
     A slot may hold a picture or a bundle (an mp4 with attached pictures); a bundle expands where it sits."""
     out = []
 
-    def keep(path):
+    def keep(path, slot=""):
+        im = Image.open(path).convert("RGB")
+        # Graydient hands an image slot a PICTURE of a render, never the video: a bundle given as /imageN:R<hash> arrives as
+        # its black first frame. Refuse it instead of using it as a chunk's edited frame.
+        if slot and float(np.asarray(im.resize((32, 32))).std()) < 2.0:
+            raise RuntimeError(f"{slot} is a blank picture. If it is a bundle, pass it in video2 (a bundle cannot travel in an "
+                               f"image slot), and bundle in the order you want with ripple-chain-bundle (video1 = the earlier bundle)")
         dst = os.path.join(work, f"stack{len(out) + 1:03d}.png")
-        Image.open(path).convert("RGB").save(dst)
+        im.save(dst)
         out.append(dst)
 
-    def add_path(path):
+    def add_path(path, slot=""):
         try:
             Image.open(path).verify()
         except Exception:
@@ -87,11 +93,11 @@ def _stack(work, bundle, images):
             for pic in pics:
                 keep(pic)
             return
-        keep(path)
+        keep(path, slot)
 
-    for ref in [bundle, *images]:
+    for slot, ref in [("video2", bundle)] + [(f"image{i + 1}", r) for i, r in enumerate(images)]:
         if (ref or "").strip():
-            add_path(_resolve(ref, work))
+            add_path(_resolve(ref, work), slot)
     return out
 
 
@@ -241,7 +247,7 @@ class SwapChainLoadLTX:
 
     mode 1 (frames only). Returns the guide's frame at the start of every chunk (chunk_frames) so you can edit them; no model
     runs. mode 2 (your frames). Step 1 takes the edited frames as a stack: the pictures of `bundle` (video2) first, then
-    image1..image8 in slot order, where a slot may hold a picture or a bundle (an mp4 of pictures) that expands in place.
+    image1..image8 in slot order. (A bundle can only travel in video2: Graydient turns a bundle given in an image slot into a picture of it.)
     Chunk k then starts on picture k. The stack is stored in the result file, so later steps need only the previous hash.
 
     Outputs mirror LoadVideoFromURLMatched (frames = N-1 source frames, width, height, length N = 8k+1, fps) plus the first

@@ -164,4 +164,12 @@ for step in range(1, 5):
     if core.read_state(prev)[0]["done"]:
         break
 assert cursors == [(0.0, 96), (4.0, 96), (8.0, 48)], cursors
+
+# a bundle that arrived as its black first frame (what Graydient gives an image slot) is refused, not used as a frame
+Image.fromarray(np.zeros((64, 64, 3), np.uint8)).save(os.path.join(inp, "blank.png"))
+try:
+    asyncio.run(N["SwapChainLoadLTX"]().run("guide.mp4", 0, 0, 96, 393216, 60, mode=2, image1="red.png", image8="blank.png"))
+    raise SystemExit("expected a blank-picture error")
+except RuntimeError as e:
+    assert "image8" in str(e) and "video2" in str(e), e
 print("STACK CHAIN OK")
