@@ -137,4 +137,31 @@ info = core.probe(prev)
 assert abs(float(info["format"]["duration"]) - 12.0) < 0.2, info["format"]["duration"]
 assert abs(core.main_video(info)[1] - 12.0) < 0.1, "stitched length drifted (overlap frames not dropped?)"
 print("tail anchor steps", n, "overlap starts at", tails)
+# ---- colour match: a darker, tinted chunk is pulled to the previous tail's colours at the start, then relaxes to its own
+tail = np.full((5, 32, 32, 3), (120, 130, 140), np.uint8)
+chunk = np.concatenate([np.full((5, 32, 32, 3), (90, 100, 105), np.uint8), np.full((60, 32, 32, 3), (90, 100, 105), np.uint8)])
+fix = core.color_match(chunk, 5, tail, 24)
+assert fix.shape == (60, 32, 32, 3)
+assert np.abs(fix[0].astype(int) - np.array([120, 130, 140])).max() <= 2, fix[0, 0, 0]       # starts on the tail's colour
+assert np.abs(fix[40].astype(int) - np.array([90, 100, 105])).max() <= 1                      # fade over: its own colour again
+assert (core.color_match(chunk, 0, tail, 24) == chunk).all()                                   # no overlap: untouched
+
+# ---- steps_left matches what the chain really does, and the card is written next to the video (video sorts first)
+for tail_on in (0, 1):
+    prev, n, left_seq = "guide.mp4", 0, []
+    while True:
+        gf, ref, ready, frames, w, h, aud, prompt, ctx, tl, tr = load(prev, "ref.png" if n == 0 else "", "x" if n == 0 else "", maxf=90, tail=tail_on)
+        asyncio.run(N["SwapChainFinish"]().run(gf, torch.full((1, 8, 8, 3), 0.5), ctx, 24, "video/CM", 24, 1))
+        mp4 = sorted(f for f in os.listdir(os.path.join(out, "video")) if f.startswith("CM_") and f.endswith(".mp4"))[-1]
+        card = mp4[:-4] + "_status.png"
+        assert os.path.isfile(os.path.join(out, "video", card)) and mp4 < card, (mp4, card)
+        prev, n = os.path.join(out, "video", mp4), n + 1
+        st, _ = core.read_state(prev)
+        left = core.steps_left(st["cursor"], st["total"], 90, st["cuts"], bool(tail_on)) if not st["done"] else 0
+        left_seq.append(left)
+        if st["done"]:
+            break
+    assert left_seq == list(range(n - 1, -1, -1)), (tail_on, left_seq, n)   # the promised count was right at every step
+    assert abs(core.main_video(core.probe(prev))[1] - 12.0) < 0.1
+print("steps_left ok; cards written")
 print("ALL OK")

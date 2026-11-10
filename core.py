@@ -185,6 +185,37 @@ def near_cut(t, cuts, tol=0.12):
     return any(abs(c - t) <= tol for c in cuts)
 
 
+def steps_left(cursor, total, max_frames, cuts, tail=True):
+    """Steps still to run from `cursor` (seconds), simulating the same chunking the nodes do (overlap + scene cuts)."""
+    n = 0
+    while cursor < total - 0.05 and n < 1000:
+        eff = cursor
+        if tail and cursor - TAIL_FRAMES / FPS >= 0 and not near_cut(cursor, cuts):
+            eff = cursor - TAIL_FRAMES / FPS
+        cursor = eff + pick_frames(eff, total, max_frames, cuts) / FPS
+        n += 1
+    return n
+
+
+def color_match(frames, ov, tail, fade=24):
+    """frames uint8 [F,h,w,3] = a chunk including its `ov` overlap frames; tail uint8 [ov,h,w,3] = the previous step's real last
+    frames at the SAME instants. Returns frames[ov:] with a per-channel mean/std correction (new overlap -> previous tail),
+    faded out over `fade` frames, so the chunk starts in the previous chunk's colour and lighting and relaxes into its own."""
+    body = frames[ov:].astype(np.float32)
+    if ov <= 0 or fade <= 0 or len(body) == 0 or tail is None or len(tail) == 0:
+        return frames[ov:]
+    new_ov, ref = frames[:ov].astype(np.float32), tail.astype(np.float32)
+    mu_n, mu_t = new_ov.mean(axis=(0, 1, 2)), ref.mean(axis=(0, 1, 2))
+    sd_n, sd_t = new_ov.std(axis=(0, 1, 2)) + 1e-3, ref.std(axis=(0, 1, 2)) + 1e-3
+    gain = np.clip(sd_t / sd_n, 0.85, 1.18)
+    corr = (body - mu_n) * gain + mu_t
+    k = min(int(fade), len(body))
+    wgt = np.zeros(len(body), np.float32)
+    wgt[:k] = 0.5 * (1.0 + np.cos(np.pi * np.arange(k) / k))
+    out = body + wgt[:, None, None, None] * (corr - body)
+    return np.clip(out, 0, 255).round().astype(np.uint8)
+
+
 def decode_guide(path, video_index, cursor, frames, w, h):
     """Guide frames [frames, h, w, 3] uint8 from the `video_index`-th video stream of `path`, starting at `cursor` s.
     Past the end of the guide the last frame is repeated."""

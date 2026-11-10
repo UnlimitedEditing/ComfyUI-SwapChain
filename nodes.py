@@ -101,6 +101,48 @@ def _stack(work, bundle, images):
     return out
 
 
+def _font(size, bold=True):
+    from PIL import ImageFont
+    for name in (("DejaVuSans-Bold.ttf", "arialbd.ttf") if bold else ("DejaVuSans.ttf", "arial.ttf")):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _write_status_card(path, step, left, done, w=768, h=432):
+    """A small progress picture saved next to the video: which step this was, how many are left, what to do next."""
+    from PIL import ImageDraw
+    im = Image.new("RGB", (w, h), (18, 22, 30))
+    d = ImageDraw.Draw(im)
+    total = step + left
+    if done:
+        head, sub = "DONE", f"All {total} steps rendered. This is your finished video."
+        accent = (88, 200, 140)
+    else:
+        head = f"STEP {step} OF {total}"
+        sub = f"{left} step{'s' if left != 1 else ''} left. Reply to this render to render the next one."
+        accent = (110, 170, 255)
+
+    def centred(text, y, font, fill):
+        box = d.textbbox((0, 0), text, font=font)
+        d.text(((w - (box[2] - box[0])) / 2, y), text, font=font, fill=fill)
+
+    centred(head, h * 0.30, _font(64), accent)
+    centred(sub, h * 0.50, _font(22, False), (225, 228, 235))
+    bar_x, bar_w, bar_y = int(w * 0.12), int(w * 0.76), int(h * 0.66)
+    d.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + 18], radius=9, fill=(48, 54, 68))
+    d.rounded_rectangle([bar_x, bar_y, bar_x + max(18, int(bar_w * step / max(1, total))), bar_y + 18], radius=9, fill=accent)
+    if not done:
+        centred("Keep the same /seed. Nothing else to type.", h * 0.76, _font(18, False), (150, 158, 172))
+    im.save(path)
+    return path
+
+
 class SwapChainLoad:
     """Start or continue a swap chain.
 
@@ -200,7 +242,7 @@ class SwapChainLoad:
         ctx = {"prev": prev, "work": work, "cursor": cursor, "frames": frames, "total": total, "step": step,
                "prompt": use_prompt, "w": w, "h": h, "cuts": cuts, "has_audio": has_audio,
                "guide_clip": "" if prev else guide_path, "guide_audio": "" if prev or not audio_path else audio_path,
-               "ov": ov}
+               "ov": ov, "tail": int(tail_anchor), "chunk": int(max_chunk_frames)}
         audio_out = {"waveform": torch.from_numpy(seg).unsqueeze(0), "sample_rate": core.SR}
         return (_image_tensor(gf), _image_tensor(ref), int(ref_ready), int(frames), int(w), int(h), audio_out,
                 use_prompt, json.dumps(ctx), _image_tensor(tail), 1 if ov else 0)
@@ -217,6 +259,9 @@ class SwapChainFinish:
             "ctx": ("STRING", {"forceInput": True}),
             "fps": ("INT", {"default": 24, "min": 8, "max": 60}),
             "filename_prefix": ("STRING", {"default": "video/SwapChain"}),
+        }, "optional": {
+            "color_match_frames": ("INT", {"default": 0, "min": 0, "max": 96}),
+            "status_card": ("INT", {"default": 0, "min": 0, "max": 1}),
         }}
 
     RETURN_TYPES = ()
@@ -224,13 +269,19 @@ class SwapChainFinish:
     OUTPUT_NODE = True
     CATEGORY = "SwapChain"
 
-    async def run(self, images, ref_image, ctx, fps, filename_prefix):
-        return await asyncio.to_thread(self._run, images, ref_image, ctx, fps, filename_prefix)
+    async def run(self, images, ref_image, ctx, fps, filename_prefix, color_match_frames=0, status_card=0):
+        return await asyncio.to_thread(self._run, images, ref_image, ctx, fps, filename_prefix, color_match_frames, status_card)
 
-    def _run(self, images, ref_image, ctx, fps, filename_prefix):
+    def _run(self, images, ref_image, ctx, fps, filename_prefix, color_match_frames=0, status_card=0):
         import folder_paths
         c = json.loads(ctx)
-        frames = (images.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)[int(c.get("ov") or 0):]
+        ov = int(c.get("ov") or 0)
+        frames = (images.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)
+        if ov and int(color_match_frames) > 0 and c.get("prev"):
+            # same instants as the overlap: the previous step's real last frames vs what this chunk made of them
+            frames = core.color_match(frames, ov, core.tail_frames(c["prev"], ov, c["w"], c["h"]), int(color_match_frames))
+        else:
+            frames = frames[ov:]
         size = (c["w"], c["h"])
         clip = core.write_clip(frames, fps, size, os.path.join(c["work"], "newclip.mp4"))
         ref = (ref_image.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)[0]
@@ -247,7 +298,15 @@ class SwapChainFinish:
         out_path = os.path.join(out_dir, sub, name)
         core.finish(c["work"], clip, c["prev"], c.get("guide_clip") or None, c.get("guide_audio") or None, ref_png, state,
                     out_path, c["total"])
-        return {"ui": {"images": [{"filename": name, "subfolder": sub, "type": "output"}], "animated": (True,)}}
+        shown = [{"filename": name, "subfolder": sub, "type": "output"}]
+        if int(status_card):
+            left = 0 if done else core.steps_left(new_cursor, c["total"], int(c.get("chunk") or core.MAX_FRAMES), c["cuts"],
+                                                  bool(c.get("tail")))
+            card = name[:-4] + "_status.png"     # sorts after the .mp4, so the video stays item 0 of the render
+            status_card_png = os.path.join(out_dir, sub, card)
+            _write_status_card(status_card_png, int(c["step"]), left, done)
+            shown.append({"filename": card, "subfolder": sub, "type": "output"})
+        return {"ui": {"images": shown, "animated": (True,)}}
 
 
 class SwapChainLoadLTX:
