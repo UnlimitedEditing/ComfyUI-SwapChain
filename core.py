@@ -161,6 +161,30 @@ def last_frame(path, out_png):
     return out_png
 
 
+TAIL_FRAMES = 5   # smallest clip MiniMaxH3AddGuide accepts (17k+5 grid, k=0)
+
+
+def tail_frames(path, n, w, h):
+    """The last `n` frames [n, h, w, 3] uint8 of the MAIN video stream of a chain file (the previous step's stitched output)."""
+    vdur = main_video(probe(path))[1]
+    r = _run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, vdur - (n + 8) / FPS):.4f}", "-i", path, "-map", "0:v:0",
+              "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+    if r.returncode:
+        raise RuntimeError(f"tail frames decode failed: {r.stderr[-300:]!r}")
+    a = np.frombuffer(r.stdout, dtype=np.uint8)
+    k = a.size // (w * h * 3)
+    if k == 0:
+        raise RuntimeError("no frames decoded from the previous step")
+    a = a[: k * w * h * 3].reshape(k, h, w, 3)[-n:]
+    if len(a) < n:
+        a = np.concatenate([np.repeat(a[:1], n - len(a), axis=0), a], axis=0)
+    return a
+
+
+def near_cut(t, cuts, tol=0.12):
+    return any(abs(c - t) <= tol for c in cuts)
+
+
 def decode_guide(path, video_index, cursor, frames, w, h):
     """Guide frames [frames, h, w, 3] uint8 from the `video_index`-th video stream of `path`, starting at `cursor` s.
     Past the end of the guide the last frame is repeated."""

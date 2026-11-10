@@ -40,8 +40,8 @@ ff("-f", "lavfi", "-i", "color=c=red:s=200x120", "-frames:v", "1", os.path.join(
 ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", os.path.join(inp, "silent.mp4"))
 
 
-def load(video, image="", prompt="", maxf=90):
-    return asyncio.run(N["SwapChainLoad"]().run(video, image, prompt, 0, 0, maxf, 262144, 60))
+def load(video, image="", prompt="", maxf=90, tail=0):
+    return asyncio.run(N["SwapChainLoad"]().run(video, image, prompt, 0, 0, maxf, 262144, 60, tail))
 
 
 def finish(images, ref, ctx):
@@ -61,7 +61,7 @@ assert core.pick_frames(0.0, 20.0, 90, cuts=[1.0]) == 90         # a cut too ear
 # ---- chain
 prev, steps, sizes = "guide.mp4", [], []
 for step in range(1, 12):
-    gf, ref, ready, frames, w, h, aud, prompt, ctx = load(prev, "ref.png" if step == 1 else "", "Female, red jacket" if step == 1 else "")
+    gf, ref, ready, frames, w, h, aud, prompt, ctx, *_ = load(prev, "ref.png" if step == 1 else "", "Female, red jacket" if step == 1 else "")
     c = json.loads(ctx)
     assert frames % 17 == 5 and gf.shape == (frames, h, w, 3), (frames, gf.shape)
     assert aud["waveform"].shape[-1] == round(frames / 24 * 44100)
@@ -99,7 +99,7 @@ except RuntimeError as e:
 # ---- silent guide: no audio stream carried, chain still completes
 prev, n = "silent.mp4", 0
 while True:
-    gf, ref, ready, frames, w, h, aud, prompt, ctx = load(prev, "ref.png" if n == 0 else "", "x" if n == 0 else "", maxf=56)
+    gf, ref, ready, frames, w, h, aud, prompt, ctx, *_ = load(prev, "ref.png" if n == 0 else "", "x" if n == 0 else "", maxf=56)
     assert float(aud["waveform"].abs().max()) == 0.0
     name = finish(gf, torch.full((1, 8, 8, 3), 0.5), ctx)
     prev, n = os.path.join(out, "video", name), n + 1
@@ -108,4 +108,33 @@ while True:
         break
 assert not st["has_audio"] and not core.has_audio(core.probe(prev)) and n >= 2
 print("silent chain steps", n)
+
+# ---- tail anchor: later chunks start TAIL_FRAMES early, are handed the previous step's real last frames, and drop them again
+prev, n, total_new, tails = "guide.mp4", 0, 0, []
+while True:
+    gf, ref, ready, frames, w, h, aud, prompt, ctx, tail, tready = load(
+        prev, "ref.png" if n == 0 else "", "x" if n == 0 else "", maxf=90, tail=1)
+    c = json.loads(ctx)
+    if n == 0:
+        assert tready == 0 and c["ov"] == 0 and tail.shape[0] == 1
+    cut_start = any(abs(cut - (c["cursor"] + c["ov"] / 24)) <= 0.12 for cut in [5.0])
+    if n and not c["ov"]:
+        assert cut_start, "overlap skipped without a scene cut"
+    if c["ov"]:
+        assert tready == 1 and tail.shape == (5, h, w, 3) and gf.shape[0] == frames
+        # the anchor IS the last 5 frames of what was already delivered
+        want = core.tail_frames(prev, 5, w, h)
+        assert np.abs(want.astype(float) / 255.0 - tail.numpy()).max() < 1e-6
+        assert aud["waveform"].shape[-1] == round(frames / 24 * 44100)
+        tails.append(round(c["cursor"], 2))
+    name = finish(gf, torch.full((1, 8, 8, 3), 0.5), ctx)
+    prev, n = os.path.join(out, "video", name), n + 1
+    st, _ = core.read_state(prev)
+    if st["done"]:
+        break
+assert tails, "no step used the tail anchor"
+info = core.probe(prev)
+assert abs(float(info["format"]["duration"]) - 12.0) < 0.2, info["format"]["duration"]
+assert abs(core.main_video(info)[1] - 12.0) < 0.1, "stitched length drifted (overlap frames not dropped?)"
+print("tail anchor steps", n, "overlap starts at", tails)
 print("ALL OK")

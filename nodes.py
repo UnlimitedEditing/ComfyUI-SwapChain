@@ -124,18 +124,21 @@ class SwapChainLoad:
             "max_chunk_frames": ("INT", {"default": core.MAX_FRAMES, "min": 22, "max": 163, "step": 1}),
             "target_pixels": ("INT", {"default": 262144, "min": 65536, "max": 4194304}),
             "max_seconds": ("INT", {"default": 60, "min": 1, "max": 600}),
+        }, "optional": {
+            "tail_anchor": ("INT", {"default": 0, "min": 0, "max": 1}),
         }}
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "INT", "INT", "INT", "INT", "AUDIO", "STRING", "STRING")
-    RETURN_NAMES = ("guide_frames", "ref_image", "ref_ready", "frames", "width", "height", "audio", "prompt", "ctx")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "INT", "INT", "INT", "INT", "AUDIO", "STRING", "STRING", "IMAGE", "INT")
+    RETURN_NAMES = ("guide_frames", "ref_image", "ref_ready", "frames", "width", "height", "audio", "prompt", "ctx",
+                    "tail_frames", "tail_ready")
     FUNCTION = "run"
     CATEGORY = "SwapChain"
 
-    async def run(self, video, image1, prompt, width, height, max_chunk_frames, target_pixels, max_seconds):
+    async def run(self, video, image1, prompt, width, height, max_chunk_frames, target_pixels, max_seconds, tail_anchor=0):
         return await asyncio.to_thread(self._run, video, image1, prompt, width, height, max_chunk_frames,
-                                       target_pixels, max_seconds)
+                                       target_pixels, max_seconds, tail_anchor)
 
-    def _run(self, video, image1, prompt, width, height, max_chunk_frames, target_pixels, max_seconds):
+    def _run(self, video, image1, prompt, width, height, max_chunk_frames, target_pixels, max_seconds, tail_anchor=0):
         import torch
         work = tempfile.mkdtemp(prefix="swapchain_")
         src = _resolve(video, work)
@@ -182,16 +185,25 @@ class SwapChainLoad:
             cursor, step, use_prompt = 0.0, 1, prompt.strip() or core.DEFAULT_DETAILS
             ref, ref_ready = given, 0
 
+        # Tail anchor: on a later step the chunk starts TAIL_FRAMES early, on the exact frames the previous step ended with, and
+        # those finished frames guide the start of the new chunk (MiniMaxH3AddGuide). They are dropped again when stitching.
+        # No anchor when the previous chunk ended on a scene cut: there is nothing to stay consistent with.
+        ov = 0
+        if prev and int(tail_anchor) and cursor - core.TAIL_FRAMES / core.FPS >= 0 and not core.near_cut(cursor, cuts):
+            ov = core.TAIL_FRAMES
+            cursor = cursor - ov / core.FPS
         frames = core.pick_frames(cursor, total, max_chunk_frames, cuts)
         gf = core.decode_guide(guide_path, guide_idx, cursor, frames, w, h)
+        tail = core.tail_frames(prev, ov, w, h) if ov else np.zeros((1, h, w, 3), np.uint8)
         seg = core.decode_audio(audio_path, audio_idx, cursor, frames) if audio_path else \
             core.decode_audio(None, None, cursor, frames)
         ctx = {"prev": prev, "work": work, "cursor": cursor, "frames": frames, "total": total, "step": step,
                "prompt": use_prompt, "w": w, "h": h, "cuts": cuts, "has_audio": has_audio,
-               "guide_clip": "" if prev else guide_path, "guide_audio": "" if prev or not audio_path else audio_path}
+               "guide_clip": "" if prev else guide_path, "guide_audio": "" if prev or not audio_path else audio_path,
+               "ov": ov}
         audio_out = {"waveform": torch.from_numpy(seg).unsqueeze(0), "sample_rate": core.SR}
         return (_image_tensor(gf), _image_tensor(ref), int(ref_ready), int(frames), int(w), int(h), audio_out,
-                use_prompt, json.dumps(ctx))
+                use_prompt, json.dumps(ctx), _image_tensor(tail), 1 if ov else 0)
 
 
 class SwapChainFinish:
@@ -218,7 +230,7 @@ class SwapChainFinish:
     def _run(self, images, ref_image, ctx, fps, filename_prefix):
         import folder_paths
         c = json.loads(ctx)
-        frames = (images.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)
+        frames = (images.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)[int(c.get("ov") or 0):]
         size = (c["w"], c["h"])
         clip = core.write_clip(frames, fps, size, os.path.join(c["work"], "newclip.mp4"))
         ref = (ref_image.cpu().numpy().clip(0, 1) * 255).round().astype(np.uint8)[0]
