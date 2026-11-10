@@ -302,9 +302,12 @@ class SwapChainFinish:
         if int(status_card):
             left = 0 if done else core.steps_left(new_cursor, c["total"], int(c.get("chunk") or core.MAX_FRAMES), c["cuts"],
                                                   bool(c.get("tail")))
-            card = name[:-4] + "_status.png"     # sorts after the .mp4, so the video stays item 0 of the render
-            status_card_png = os.path.join(out_dir, sub, card)
-            _write_status_card(status_card_png, int(c["step"]), left, done)
+            # The card is a 2 s mp4, not a picture: Graydient lists a render's pictures BEFORE its videos, so a PNG would become item 0
+            # and /video1:R<hash> (which binds item 0 only) would get the card instead of the video. "_status.mp4" sorts after the video.
+            card = name[:-4] + "_status.mp4"
+            png = os.path.join(c["work"], "status_card.png")
+            _write_status_card(png, int(c["step"]), left, done)
+            core.png_to_clip(png, os.path.join(out_dir, sub, card))
             shown.append({"filename": card, "subfolder": sub, "type": "output"})
         return {"ui": {"images": shown, "animated": (True,)}}
 

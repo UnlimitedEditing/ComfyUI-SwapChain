@@ -152,9 +152,10 @@ for tail_on in (0, 1):
     while True:
         gf, ref, ready, frames, w, h, aud, prompt, ctx, tl, tr = load(prev, "ref.png" if n == 0 else "", "x" if n == 0 else "", maxf=90, tail=tail_on)
         asyncio.run(N["SwapChainFinish"]().run(gf, torch.full((1, 8, 8, 3), 0.5), ctx, 24, "video/CM", 24, 1))
-        mp4 = sorted(f for f in os.listdir(os.path.join(out, "video")) if f.startswith("CM_") and f.endswith(".mp4"))[-1]
-        card = mp4[:-4] + "_status.png"
+        mp4 = sorted(f for f in os.listdir(os.path.join(out, "video")) if f.startswith("CM_") and f.endswith(".mp4") and "_status" not in f)[-1]
+        card = mp4[:-4] + "_status.mp4"
         assert os.path.isfile(os.path.join(out, "video", card)) and mp4 < card, (mp4, card)
+        assert core.main_video(core.probe(os.path.join(out, "video", card)))[1] > 1.5
         prev, n = os.path.join(out, "video", mp4), n + 1
         st, _ = core.read_state(prev)
         left = core.steps_left(st["cursor"], st["total"], 90, st["cuts"], bool(tail_on)) if not st["done"] else 0

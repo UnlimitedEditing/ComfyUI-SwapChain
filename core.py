@@ -307,6 +307,16 @@ def write_clip(frames_rgb, fps, size, out_path):
     return out_path
 
 
+def png_to_clip(png, out_path, seconds=2.0):
+    """A still picture as a tiny silent h264 mp4 (even dimensions), used for the status card."""
+    r = _run(["ffmpeg", "-y", "-v", "error", "-loop", "1", "-framerate", str(FPS), "-i", png, "-t", f"{seconds:.2f}",
+              "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+              "-pix_fmt", "yuv420p", "-r", str(FPS), "-movflags", "+faststart", out_path])
+    if r.returncode:
+        raise RuntimeError(f"status card encode failed: {r.stderr[-300:]!r}")
+    return out_path
+
+
 def finish(work, new_clip, prev_video, guide_clip, guide_audio, ref_png, state, out_path, total):
     """Stitch new_clip after prev_video's main stream and write the self-contained mp4.
 
